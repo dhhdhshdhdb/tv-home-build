@@ -12,18 +12,18 @@ permissions:
 
 jobs:
   build:
-    name: Build and verify TV Home
+    name: Build and verify APK
     runs-on: ubuntu-latest
     timeout-minutes: 15
 
     steps:
-      - name: Checkout launcher source
+      - name: Checkout upstream source
         uses: actions/checkout@v4
         with:
           repository: mihirgupta0900/tv-home
           path: source
 
-      - name: Set up Java 17
+      - name: Set up Java
         uses: actions/setup-java@v4
         with:
           distribution: temurin
@@ -36,11 +36,10 @@ jobs:
         run: |
           sdkmanager "platforms;android-34" "build-tools;34.0.0"
 
-      - name: Patch launcher safely
+      - name: Patch source
         shell: bash
         run: |
           set -euo pipefail
-
           python3 <<'PY'
           from pathlib import Path
           import re
@@ -48,34 +47,35 @@ jobs:
           root = Path("source/launcher")
           java = root / "src/com/mihir/tvhome/MainActivity.java"
           manifest = root / "AndroidManifest.xml"
-          script = root / "build-and-install.sh"
+          build_script = root / "build-and-install.sh"
 
-          for path in (java, manifest, script):
-              if not path.is_file():
-                  raise SystemExit(f"ERROR: required file missing: {path}")
+          for p in (java, manifest, build_script):
+              if not p.is_file():
+                  raise SystemExit(f"Required file not found: {p}")
 
           s = java.read_text()
 
-          def once(old, new, label):
+          def replace_exact(old, new, label):
               global s
-              count = s.count(old)
-              if count != 1:
+              n = s.count(old)
+              if n != 1:
                   raise SystemExit(
-                      f"ERROR: {label}: expected one match, got {count}"
+                      f"{label}: expected one match, found {n}; "
+                      "source was not modified safely."
                   )
               s = s.replace(old, new, 1)
 
-          # Track the category used to discover each launchable app.
-          once(
+          # Store which launch category belongs to each app.
+          replace_exact(
               "        String pkg, label;\n"
               "        ComponentName component;",
               "        String pkg, label, launchCategory;\n"
               "        ComponentName component;",
-              "App model field"
+              "App fields"
           )
 
-          # Hide YouTube from this launcher's list only.
-          once(
+          # Hide YouTube from this launcher only.
+          replace_exact(
               "        hidden.add(getPackageName());",
               "        hidden.add(getPackageName());\n"
               "        hidden.add(\"com.google.android.youtube.tv\");\n"
@@ -83,7 +83,7 @@ jobs:
               "YouTube exclusion"
           )
 
-          # Discover both Android TV and standard Android launcher apps.
+          # Discover Android TV apps and regular Android launcher apps.
           pattern = re.compile(
               r"        Intent q = new Intent\(Intent\.ACTION_MAIN\)"
               r"\.addCategory\(Intent\.CATEGORY_LEANBACK_LAUNCHER\);"
@@ -113,14 +113,8 @@ jobs:
           s, count = pattern.subn(replacement, s, count=1)
           if count != 1:
               raise SystemExit(
-                  "ERROR: could not safely replace the app discovery block"
+                  "App discovery block not found; refusing to patch wrong code."
               )
-
-          # Shared tile creation for either launcher category.
-          marker = (
-              "    /** A 16:9 card with the app's banner; "
-              "the name shows under it while focused. */"
-          )
 
           helper = """    private void addLaunchableApp(
             PackageManager pm, Map<String, App> byPkg,
@@ -150,17 +144,29 @@ jobs:
 
 """
 
-          once(marker, helper + marker, "App discovery helper")
+          # Insert helper before tile creation, regardless of nearby comments.
+          tile_pattern = re.compile(r"(?m)^    private (?:View|LinearLayout|FrameLayout)\s+tile\s*\(")
+          matches = list(tile_pattern.finditer(s))
+          if len(matches) != 1:
+              raise SystemExit(
+                  f"Tile method marker: expected one match, found {len(matches)}."
+              )
+          pos = matches[0].start()
+          s = s[:pos] + helper + s[pos:]
 
-          once(
+          # Launch each app with the category used to discover it.
+          old_launch = (
               ".addCategory(Intent.CATEGORY_LEANBACK_LAUNCHER)\n"
-              "                .setComponent(app.component)",
+              "                .setComponent(app.component)"
+          )
+          replace_exact(
+              old_launch,
               ".addCategory(app.launchCategory)\n"
               "                .setComponent(app.component)",
-              "App launch category"
+              "Launch category"
           )
 
-          # Keep the visual effects, but shorten focus animations slightly.
+          # Preserve focus effects while making them slightly quicker.
           s = s.replace(
               ".setInterpolator(has ? new OvershootInterpolator(1.8f) "
               ": new DecelerateInterpolator())\n"
@@ -179,44 +185,45 @@ jobs:
 
           java.write_text(s)
 
-          # Make ordinary Android launcher apps visible to package queries.
+          # Allow queries for both Android TV and standard launcher activities.
           xml = manifest.read_text()
           if "</queries>" not in xml:
-              raise SystemExit("ERROR: AndroidManifest.xml has no </queries>")
+              raise SystemExit("AndroidManifest.xml has no </queries> section.")
 
-          if 'android.intent.category.LAUNCHER' not in xml:
+          if "android.intent.category.LAUNCHER" not in xml:
               xml = xml.replace(
                   "</queries>",
                   """    <intent>
-            <action android:name="android.intent.action.MAIN" />
-            <category android:name="android.intent.category.LAUNCHER" />
-          </intent>
+                      <action android:name="android.intent.action.MAIN" />
+                      <category android:name="android.intent.category.LAUNCHER" />
+                  </intent>
           </queries>""",
                   1
               )
           manifest.write_text(xml)
 
-          # Lower minimum SDK from 30 to 26 for Android 8.0+ devices.
-          build_script = script.read_text()
-          build_script = build_script.replace(
-              "--min-sdk-version 30", "--min-sdk-version 26"
-          ).replace("--min-api 30", "--min-api 26")
-          script.write_text(build_script)
+          # Target Android 8.0+ (API 26) where supported by this project.
+          sh = build_script.read_text()
+          sh = sh.replace("--min-sdk-version 30", "--min-sdk-version 26")
+          sh = sh.replace("--min-api 30", "--min-api 26")
+          build_script.write_text(sh)
 
-          print("Launcher source patched successfully.")
+          print("Source patch completed.")
           PY
 
       - name: Build APK
         working-directory: source/launcher
         run: bash build-and-install.sh --build
 
-      - name: Verify APK
+      - name: Verify APK exists
+        shell: bash
         run: |
           set -euo pipefail
           test -s source/launcher/build/tvhome.apk
+          file source/launcher/build/tvhome.apk
           ls -lh source/launcher/build/tvhome.apk
 
-      - name: Upload APK artifact
+      - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
           name: tvhome-apk
