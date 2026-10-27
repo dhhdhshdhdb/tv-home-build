@@ -12,16 +12,18 @@ permissions:
 
 jobs:
   build:
+    name: Build and verify TV Home
     runs-on: ubuntu-latest
+    timeout-minutes: 15
 
     steps:
-      - name: Download source
+      - name: Checkout launcher source
         uses: actions/checkout@v4
         with:
           repository: mihirgupta0900/tv-home
           path: source
 
-      - name: Set up Java
+      - name: Set up Java 17
         uses: actions/setup-java@v4
         with:
           distribution: temurin
@@ -30,86 +32,67 @@ jobs:
       - name: Set up Android SDK
         uses: android-actions/setup-android@v4
 
-      - name: Install Android tools
-        run: sdkmanager "platforms;android-34" "build-tools;34.0.0"
-
-      - name: Lower minimum Android version
+      - name: Install Android SDK packages
         run: |
-          python3 - <<'PY'
-          from pathlib import Path
+          sdkmanager "platforms;android-34" "build-tools;34.0.0"
 
-          path = Path("source/launcher/build-and-install.sh")
-          content = path.read_text()
-
-          for old, new in [
-              ("--min-sdk-version 30", "--min-sdk-version 26"),
-              ("--min-api 30", "--min-api 26"),
-          ]:
-              if old in content:
-                  content = content.replace(old, new)
-
-          path.write_text(content)
-          print("Проверена минимальная версия Android.")
-          PY
-
-      - name: Patch launcher source
+      - name: Patch launcher safely
+        shell: bash
         run: |
-          python3 - <<'PY'
+          set -euo pipefail
+
+          python3 <<'PY'
           from pathlib import Path
+          import re
 
-          java_path = Path(
-              "source/launcher/src/com/mihir/tvhome/MainActivity.java"
-          )
-          content = java_path.read_text()
+          root = Path("source/launcher")
+          java = root / "src/com/mihir/tvhome/MainActivity.java"
+          manifest = root / "AndroidManifest.xml"
+          script = root / "build-and-install.sh"
 
-          def replace_once(old, new, label):
-              global content
-              count = content.count(old)
+          for path in (java, manifest, script):
+              if not path.is_file():
+                  raise SystemExit(f"ERROR: required file missing: {path}")
+
+          s = java.read_text()
+
+          def once(old, new, label):
+              global s
+              count = s.count(old)
               if count != 1:
                   raise SystemExit(
-                      f"{label}: ожидалось 1 совпадение, найдено {count}. "
-                      "Сборка остановлена."
+                      f"ERROR: {label}: expected one match, got {count}"
                   )
-              content = content.replace(old, new, 1)
+              s = s.replace(old, new, 1)
 
-          # 1. Запоминаем категорию, через которую найдено приложение.
-          replace_once(
-              "        String pkg, label;\n        ComponentName component;",
+          # Track the category used to discover each launchable app.
+          once(
+              "        String pkg, label;\n"
+              "        ComponentName component;",
               "        String pkg, label, launchCategory;\n"
               "        ComponentName component;",
-              "Поле категории запуска"
+              "App model field"
           )
 
-          # 2. Скрываем YouTube, не удаляя само приложение с телевизора.
-          replace_once(
+          # Hide YouTube from this launcher's list only.
+          once(
               "        hidden.add(getPackageName());",
               "        hidden.add(getPackageName());\n"
               "        hidden.add(\"com.google.android.youtube.tv\");\n"
               "        hidden.add(\"com.google.android.youtube\");",
-              "Скрытие YouTube"
+              "YouTube exclusion"
           )
 
-          # 3. Заменяем каталог: сначала Android TV, затем обычные приложения.
-          start = content.find(
-              "        Intent q = new Intent(Intent.ACTION_MAIN)"
-              ".addCategory(Intent.CATEGORY_LEANBACK_LAUNCHER);"
+          # Discover both Android TV and standard Android launcher apps.
+          pattern = re.compile(
+              r"        Intent q = new Intent\(Intent\.ACTION_MAIN\)"
+              r"\.addCategory\(Intent\.CATEGORY_LEANBACK_LAUNCHER\);"
+              r".*?"
+              r"        List<App> dock = new ArrayList<>\(\);",
+              re.S
           )
-          end_marker = "        List<App> dock = new ArrayList<>();"
-          end = content.find(end_marker, start)
 
-          if start < 0 or end < 0:
-              raise SystemExit(
-                  "Не найден блок каталога приложений. Сборка остановлена."
-              )
-
-          old_block = content[start:end]
-          if "byPkg.put(ai.packageName, a);" not in old_block:
-              raise SystemExit(
-                  "Блок каталога отличается от ожидаемого. "
-                  "Сборка остановлена."
-              )
-
-          new_block = '''        Map<String, App> byPkg = new HashMap<>();
+          replacement = """        Map<String, App> byPkg = new HashMap<>();
 
                   Intent tvQuery = new Intent(Intent.ACTION_MAIN)
                           .addCategory(Intent.CATEGORY_LEANBACK_LAUNCHER);
@@ -125,16 +108,21 @@ jobs:
                               pm, byPkg, ri, Intent.CATEGORY_LAUNCHER);
                   }
 
-          '''
-          content = content[:start] + new_block + content[end:]
+                  List<App> dock = new ArrayList<>();"""
 
-          # 4. Общий метод создания плитки приложения.
+          s, count = pattern.subn(replacement, s, count=1)
+          if count != 1:
+              raise SystemExit(
+                  "ERROR: could not safely replace the app discovery block"
+              )
+
+          # Shared tile creation for either launcher category.
           marker = (
               "    /** A 16:9 card with the app's banner; "
               "the name shows under it while focused. */"
           )
 
-          helper = '''    private void addLaunchableApp(
+          helper = """    private void addLaunchableApp(
             PackageManager pm, Map<String, App> byPkg,
             ResolveInfo ri, String category) {
         ActivityInfo ai = ri.activityInfo;
@@ -160,86 +148,78 @@ jobs:
         byPkg.put(ai.packageName, a);
     }
 
-'''
-          replace_once(marker, helper + marker, "Метод добавления приложений")
+"""
 
-          # 5. Запускаем плитку с правильной категорией.
-          replace_once(
+          once(marker, helper + marker, "App discovery helper")
+
+          once(
               ".addCategory(Intent.CATEGORY_LEANBACK_LAUNCHER)\n"
               "                .setComponent(app.component)",
               ".addCategory(app.launchCategory)\n"
               "                .setComponent(app.component)",
-              "Запуск приложений"
+              "App launch category"
           )
 
-          # 6. Умеренно ускоряем анимации фокуса.
-          replace_once(
+          # Keep the visual effects, but shorten focus animations slightly.
+          s = s.replace(
               ".setInterpolator(has ? new OvershootInterpolator(1.8f) "
               ": new DecelerateInterpolator())\n"
               "                .setDuration(has ? 320 : 200).start();",
               ".setInterpolator(new DecelerateInterpolator())\n"
-              "                .setDuration(has ? 220 : 160).start();",
-              "Анимация плиток"
+              "                .setDuration(has ? 220 : 160).start();"
           )
-
-          replace_once(
+          s = s.replace(
               "shine.animate().alpha(has ? 1f : 0f).setDuration(160).start();",
-              "shine.animate().alpha(has ? 1f : 0f).setDuration(120).start();",
-              "Анимация подсветки"
+              "shine.animate().alpha(has ? 1f : 0f).setDuration(120).start();"
           )
-
-          replace_once(
-              "label.animate().alpha(has ? 1f : 0f)"
+          s = s.replace(
               ".translationY(has ? dp(4) : 0).setDuration(200).start();",
-              "label.animate().alpha(has ? 1f : 0f)"
-              ".translationY(has ? dp(4) : 0).setDuration(150).start();",
-              "Анимация подписи"
+              ".translationY(has ? dp(4) : 0).setDuration(150).start();"
           )
 
-          java_path.write_text(content)
-          print("Java-патчи применены.")
+          java.write_text(s)
 
-          # 7. Разрешаем системе видеть оба типа запускаемых приложений.
-          manifest_path = Path("source/launcher/AndroidManifest.xml")
-          xml = manifest_path.read_text()
+          # Make ordinary Android launcher apps visible to package queries.
+          xml = manifest.read_text()
+          if "</queries>" not in xml:
+              raise SystemExit("ERROR: AndroidManifest.xml has no </queries>")
 
-          queries_end = xml.find("</queries>")
-          if queries_end < 0:
-              raise SystemExit("Manifest: не найден </queries>.")
-
-          launcher_category = (
-              'android:name="android.intent.category.LAUNCHER"'
-          )
-
-          if launcher_category not in xml:
-              launcher_intent = '''        <intent>
-                      <action android:name="android.intent.action.MAIN" />
-                      <category android:name="android.intent.category.LAUNCHER" />
-                  </intent>
-        '''
-              xml = (
-                  xml[:queries_end]
-                  + launcher_intent
-                  + xml[queries_end:]
+          if 'android.intent.category.LAUNCHER' not in xml:
+              xml = xml.replace(
+                  "</queries>",
+                  """    <intent>
+            <action android:name="android.intent.action.MAIN" />
+            <category android:name="android.intent.category.LAUNCHER" />
+          </intent>
+          </queries>""",
+                  1
               )
+          manifest.write_text(xml)
 
-          manifest_path.write_text(xml)
-          print("Manifest обновлён.")
-          print("Проверки текстовых патчей завершены.")
+          # Lower minimum SDK from 30 to 26 for Android 8.0+ devices.
+          build_script = script.read_text()
+          build_script = build_script.replace(
+              "--min-sdk-version 30", "--min-sdk-version 26"
+          ).replace("--min-api 30", "--min-api 26")
+          script.write_text(build_script)
+
+          print("Launcher source patched successfully.")
           PY
 
       - name: Build APK
         working-directory: source/launcher
         run: bash build-and-install.sh --build
 
-      - name: Check APK
+      - name: Verify APK
         run: |
+          set -euo pipefail
           test -s source/launcher/build/tvhome.apk
           ls -lh source/launcher/build/tvhome.apk
 
-      - name: Save APK
+      - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
           name: tvhome-apk
           path: source/launcher/build/tvhome.apk
           if-no-files-found: error
+          retention-days: 7
