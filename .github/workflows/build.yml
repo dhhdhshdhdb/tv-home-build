@@ -41,42 +41,43 @@ jobs:
           path = Path("source/launcher/build-and-install.sh")
           content = path.read_text()
 
-          replacements = {
-              "--min-sdk-version 30": "--min-sdk-version 26",
-              "--min-api 30": "--min-api 26",
-          }
-
-          for old, new in replacements.items():
+          for old, new in [
+              ("--min-sdk-version 30", "--min-sdk-version 26"),
+              ("--min-api 30", "--min-api 26"),
+          ]:
               if old not in content:
-                  raise SystemExit(f"Не найдена ожидаемая настройка: {old}")
+                  raise SystemExit(f"Не найдена настройка: {old}")
               content = content.replace(old, new)
 
           path.write_text(content)
-          print("Минимальная версия Android изменена на API 26.")
+          print("Минимальная версия Android: API 26")
           PY
 
       - name: Fix YouTube tile banner
         run: |
           python3 - <<'PY'
           from pathlib import Path
+          import re
 
           path = Path("source/launcher/src/com/mihir/tvhome/MainActivity.java")
           content = path.read_text()
 
-          old = """            a.isBanner = banner != null;
-            a.art = banner != null ? banner : ri.loadIcon(pm);"""
+          pattern = r'(?m)^([ \t]*)a\.isBanner = banner != null;\s*\n[ \t]*a\.art = banner != null \? banner : ri\.loadIcon\(pm\);'
 
-          new = """            if ("com.google.android.youtube.tv".equals(ai.packageName)
-                    || "com.google.android.youtube".equals(ai.packageName)) {
-                banner = null;
-            }
-            a.isBanner = banner != null;
-            a.art = banner != null ? banner : ri.loadIcon(pm);"""
+          replacement = r'''\1if ("com.google.android.youtube.tv".equals(ai.packageName)
+          \1        || "com.google.android.youtube".equals(ai.packageName)) {
+          \1    banner = null;
+          \1}
+          \1a.isBanner = banner != null;
+          \1a.art = banner != null ? banner : ri.loadIcon(pm);'''
 
-          if old not in content:
-              raise SystemExit("Не найдена строка для исправления YouTube.")
-          path.write_text(content.replace(old, new, 1))
-          print("Для YouTube включено использование обычной иконки.")
+          content, count = re.subn(pattern, replacement, content, count=1)
+
+          if count != 1:
+              raise SystemExit("Не удалось найти блок баннера в MainActivity.java")
+
+          path.write_text(content)
+          print("YouTube будет использовать обычную иконку.")
           PY
 
       - name: Build APK
