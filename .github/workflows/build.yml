@@ -1,3 +1,4 @@
+
 name: Build TV Home APK
 
 on:
@@ -44,62 +45,71 @@ jobs:
               ("--min-sdk-version 30", "--min-sdk-version 26"),
               ("--min-api 30", "--min-api 26"),
           ]:
-              if old not in content:
-                  raise SystemExit(f"Не найдена настройка: {old}")
-              content = content.replace(old, new)
+              if old in content:
+                  content = content.replace(old, new)
 
           path.write_text(content)
-          print("Минимальная версия Android: API 26")
+          print("Проверена минимальная версия Android.")
           PY
 
       - name: Patch launcher source
         run: |
           python3 - <<'PY'
           from pathlib import Path
-          import re
 
-          java = Path("source/launcher/src/com/mihir/tvhome/MainActivity.java")
-          content = java.read_text()
+          java_path = Path(
+              "source/launcher/src/com/mihir/tvhome/MainActivity.java"
+          )
+          content = java_path.read_text()
 
-          def replace_once(pattern, replacement, label, flags=0):
+          def replace_once(old, new, label):
               global content
-              updated, count = re.subn(
-                  pattern, replacement, content, count=1, flags=flags
-              )
+              count = content.count(old)
               if count != 1:
                   raise SystemExit(
-                      f"{label}: ожидалось одно совпадение, найдено {count}. "
-                      "Сборка остановлена; исходник не будет собран."
+                      f"{label}: ожидалось 1 совпадение, найдено {count}. "
+                      "Сборка остановлена."
                   )
-              content = updated
+              content = content.replace(old, new, 1)
 
-          # 1. Store the category used to launch each app.
+          # 1. Запоминаем категорию, через которую найдено приложение.
           replace_once(
-              r'(?m)^([ \t]*)String pkg, label;\s*$',
-              r'\1String pkg, label, launchCategory;',
+              "        String pkg, label;\n        ComponentName component;",
+              "        String pkg, label, launchCategory;\n"
+              "        ComponentName component;",
               "Поле категории запуска"
           )
 
-          # 2. Hide YouTube from both the dock and the app grid.
+          # 2. Скрываем YouTube, не удаляя само приложение с телевизора.
           replace_once(
-              r'(?m)^([ \t]*)hidden\.add\(getPackageName\(\)\);$',
-              r'\1hidden.add(getPackageName());\n'
-              r'\1hidden.add("com.google.android.youtube.tv");\n'
-              r'\1hidden.add("com.google.android.youtube");',
+              "        hidden.add(getPackageName());",
+              "        hidden.add(getPackageName());\n"
+              "        hidden.add(\"com.google.android.youtube.tv\");\n"
+              "        hidden.add(\"com.google.android.youtube\");",
               "Скрытие YouTube"
           )
 
-          # 3. Discover Android TV apps first, then ordinary Android launcher apps.
-          catalog_pattern = (
-              r'(?ms)^        Intent q = new Intent\(Intent\.ACTION_MAIN\)'
-              r'\.addCategory\(Intent\.CATEGORY_LEANBACK_LAUNCHER\);\n'
-              r'        Map<String, App> byPkg = new HashMap<>\(\);\n'
-              r'        for \(ResolveInfo ri : pm\.queryIntentActivities\(q, 0\)\) \{\n'
-              r'.*?'
-              r'        \}\n(?=\n        List<App> dock = new ArrayList<>\(\);)'
+          # 3. Заменяем каталог: сначала Android TV, затем обычные приложения.
+          start = content.find(
+              "        Intent q = new Intent(Intent.ACTION_MAIN)"
+              ".addCategory(Intent.CATEGORY_LEANBACK_LAUNCHER);"
           )
+          end_marker = "        List<App> dock = new ArrayList<>();"
+          end = content.find(end_marker, start)
 
-          catalog_replacement = '''        Map<String, App> byPkg = new HashMap<>();
+          if start < 0 or end < 0:
+              raise SystemExit(
+                  "Не найден блок каталога приложений. Сборка остановлена."
+              )
+
+          old_block = content[start:end]
+          if "byPkg.put(ai.packageName, a);" not in old_block:
+              raise SystemExit(
+                  "Блок каталога отличается от ожидаемого. "
+                  "Сборка остановлена."
+              )
+
+          new_block = '''        Map<String, App> byPkg = new HashMap<>();
 
                   Intent tvQuery = new Intent(Intent.ACTION_MAIN)
                           .addCategory(Intent.CATEGORY_LEANBACK_LAUNCHER);
@@ -114,16 +124,12 @@ jobs:
                       addLaunchableApp(
                               pm, byPkg, ri, Intent.CATEGORY_LAUNCHER);
                   }
+
           '''
+          content = content[:start] + new_block + content[end:]
 
-          replace_once(
-              catalog_pattern,
-              lambda match: catalog_replacement,
-              "Замена каталога приложений"
-          , flags=0)
-
-          # 4. Centralize app creation and prevent YouTube banners from being used.
-          helper_marker = (
+          # 4. Общий метод создания плитки приложения.
+          marker = (
               "    /** A 16:9 card with the app's banner; "
               "the name shows under it while focused. */"
           )
@@ -151,88 +157,75 @@ jobs:
         a.isBanner = banner != null;
         a.art = banner != null ? banner : ri.loadIcon(pm);
         a.color = sampleColor(a.pkg, a.art);
-        byPkg.put(a.pkg, a);
+        byPkg.put(ai.packageName, a);
     }
 
 '''
+          replace_once(marker, helper + marker, "Метод добавления приложений")
 
-          if content.count(helper_marker) != 1:
-              raise SystemExit(
-                  "Метод добавления приложений: не найдено "
-                  "единственное место вставки."
-              )
-          content = content.replace(helper_marker, helper + helper_marker, 1)
-
-          # 5. Launch each tile using the category that discovered it.
-          click_pattern = (
-              r'(?s)(card\.setOnClickListener\(v -> launch\(new Intent\(Intent\.ACTION_MAIN\)\s*)'
-              r'\.addCategory\(Intent\.CATEGORY_LEANBACK_LAUNCHER\)'
-          )
+          # 5. Запускаем плитку с правильной категорией.
           replace_once(
-              click_pattern,
-              r'\1.addCategory(app.launchCategory)',
-              "Запуск приложений разных типов"
+              ".addCategory(Intent.CATEGORY_LEANBACK_LAUNCHER)\n"
+              "                .setComponent(app.component)",
+              ".addCategory(app.launchCategory)\n"
+              "                .setComponent(app.component)",
+              "Запуск приложений"
           )
 
-          # 6. Reduce focus animation duration without removing the visual effects.
+          # 6. Умеренно ускоряем анимации фокуса.
           replace_once(
-              r'\.setInterpolator\(has \? new OvershootInterpolator\(1\.8f\) : new DecelerateInterpolator\(\)\)\s*'
-              r'\.setDuration\(has \? 320 : 200\)\.start\(\);',
-              '.setInterpolator(new DecelerateInterpolator())\n'
-              '                    .setDuration(has ? 220 : 160).start();',
-              "Анимация фокуса"
+              ".setInterpolator(has ? new OvershootInterpolator(1.8f) "
+              ": new DecelerateInterpolator())\n"
+              "                .setDuration(has ? 320 : 200).start();",
+              ".setInterpolator(new DecelerateInterpolator())\n"
+              "                .setDuration(has ? 220 : 160).start();",
+              "Анимация плиток"
           )
 
           replace_once(
-              r'shine\.animate\(\)\.alpha\(has \? 1f : 0f\)'
-              r'\.setDuration\(160\)\.start\(\);',
-              'shine.animate().alpha(has ? 1f : 0f).setDuration(120).start();',
+              "shine.animate().alpha(has ? 1f : 0f).setDuration(160).start();",
+              "shine.animate().alpha(has ? 1f : 0f).setDuration(120).start();",
               "Анимация подсветки"
           )
 
           replace_once(
-              r'label\.animate\(\)\.alpha\(has \? 1f : 0f\)'
-              r'\.translationY\(has \? dp\(4\) : 0\)\.setDuration\(200\)\.start\(\);',
-              'label.animate().alpha(has ? 1f : 0f)'
-              '.translationY(has ? dp(4) : 0).setDuration(150).start();',
+              "label.animate().alpha(has ? 1f : 0f)"
+              ".translationY(has ? dp(4) : 0).setDuration(200).start();",
+              "label.animate().alpha(has ? 1f : 0f)"
+              ".translationY(has ? dp(4) : 0).setDuration(150).start();",
               "Анимация подписи"
           )
 
-          java.write_text(content)
+          java_path.write_text(content)
           print("Java-патчи применены.")
 
-          # 7. Allow queries for both Android TV and ordinary Android launchers.
-          manifest = Path("source/launcher/AndroidManifest.xml")
-          xml = manifest.read_text()
+          # 7. Разрешаем системе видеть оба типа запускаемых приложений.
+          manifest_path = Path("source/launcher/AndroidManifest.xml")
+          xml = manifest_path.read_text()
 
-          leanback = '''        <intent>
-                      <action android:name="android.intent.action.MAIN" />
-                      <category android:name="android.intent.category.LEANBACK_LAUNCHER" />
-                  </intent>'''
+          queries_end = xml.find("</queries>")
+          if queries_end < 0:
+              raise SystemExit("Manifest: не найден </queries>.")
 
-          launcher = leanback + '''
-                  <intent>
+          launcher_category = (
+              'android:name="android.intent.category.LAUNCHER"'
+          )
+
+          if launcher_category not in xml:
+              launcher_intent = '''        <intent>
                       <action android:name="android.intent.action.MAIN" />
                       <category android:name="android.intent.category.LAUNCHER" />
-                  </intent>'''
-
-          if xml.count(leanback) != 1:
-              raise SystemExit(
-                  "Manifest: не найден уникальный LEANBACK intent."
+                  </intent>
+        '''
+              xml = (
+                  xml[:queries_end]
+                  + launcher_intent
+                  + xml[queries_end:]
               )
 
-          xml = xml.replace(leanback, launcher, 1)
-          manifest.write_text(xml)
+          manifest_path.write_text(xml)
           print("Manifest обновлён.")
-
-          # 8. Sanity checks before compiling.
-          assert 'String pkg, label, launchCategory;' in content
-          assert 'addCategory(app.launchCategory)' in content
-          assert 'com.google.android.youtube.tv' in content
-          assert 'CATEGORY_LAUNCHER' in content
-          assert xml.count('android.intent.category.LAUNCHER') == 1
-
-          print("Проверки патчей пройдены.")
+          print("Проверки текстовых патчей завершены.")
           PY
 
       - name: Build APK
