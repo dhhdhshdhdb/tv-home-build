@@ -12,12 +12,10 @@ permissions:
 
 jobs:
   build:
-    name: Build and verify APK
     runs-on: ubuntu-latest
-    timeout-minutes: 15
 
     steps:
-      - name: Checkout upstream source
+      - name: Download source
         uses: actions/checkout@v4
         with:
           repository: mihirgupta0900/tv-home
@@ -32,201 +30,72 @@ jobs:
       - name: Set up Android SDK
         uses: android-actions/setup-android@v4
 
-      - name: Install Android SDK packages
-        run: |
-          sdkmanager "platforms;android-34" "build-tools;34.0.0"
+      - name: Install Android tools
+        run: sdkmanager "platforms;android-34" "build-tools;34.0.0"
 
-      - name: Patch source
-        shell: bash
+      - name: Lower minimum Android version
         run: |
-          set -euo pipefail
-          python3 <<'PY'
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path("source/launcher/build-and-install.sh")
+          content = path.read_text()
+
+          for old, new in [
+              ("--min-sdk-version 30", "--min-sdk-version 26"),
+              ("--min-api 30", "--min-api 26"),
+          ]:
+              if old not in content:
+                  raise SystemExit(f"Не найдена настройка: {old}")
+              content = content.replace(old, new)
+
+          path.write_text(content)
+          print("Минимальная версия Android: API 26")
+          PY
+
+      - name: Fix YouTube tile banner
+        run: |
+          python3 - <<'PY'
           from pathlib import Path
           import re
 
-          root = Path("source/launcher")
-          java = root / "src/com/mihir/tvhome/MainActivity.java"
-          manifest = root / "AndroidManifest.xml"
-          build_script = root / "build-and-install.sh"
+          path = Path("source/launcher/src/com/mihir/tvhome/MainActivity.java")
+          content = path.read_text()
 
-          for p in (java, manifest, build_script):
-              if not p.is_file():
-                  raise SystemExit(f"Required file not found: {p}")
+          pattern = r'(?m)^([ \t]*)a\.isBanner = banner != null;\s*\n[ \t]*a\.art = banner != null \? banner : ri\.loadIcon\(pm\);'
 
-          s = java.read_text()
+          replacement = r'''\1if ("com.google.android.youtube.tv".equals(ai.packageName)
+          \1        || "com.google.android.youtube".equals(ai.packageName)) {
+          \1    banner = null;
+          \1}
+          \1a.isBanner = banner != null;
+          \1a.art = banner != null ? banner : ri.loadIcon(pm);'''
 
-          def replace_exact(old, new, label):
-              global s
-              n = s.count(old)
-              if n != 1:
-                  raise SystemExit(
-                      f"{label}: expected one match, found {n}; "
-                      "source was not modified safely."
-                  )
-              s = s.replace(old, new, 1)
-
-          # Store which launch category belongs to each app.
-          replace_exact(
-              "        String pkg, label;\n"
-              "        ComponentName component;",
-              "        String pkg, label, launchCategory;\n"
-              "        ComponentName component;",
-              "App fields"
+          content, count = re.subn(
+              pattern, replacement, content, count=1
           )
 
-          # Hide YouTube from this launcher only.
-          replace_exact(
-              "        hidden.add(getPackageName());",
-              "        hidden.add(getPackageName());\n"
-              "        hidden.add(\"com.google.android.youtube.tv\");\n"
-              "        hidden.add(\"com.google.android.youtube\");",
-              "YouTube exclusion"
-          )
-
-          # Discover Android TV apps and regular Android launcher apps.
-          pattern = re.compile(
-              r"        Intent q = new Intent\(Intent\.ACTION_MAIN\)"
-              r"\.addCategory\(Intent\.CATEGORY_LEANBACK_LAUNCHER\);"
-              r".*?"
-              r"        List<App> dock = new ArrayList<>\(\);",
-              re.S
-          )
-
-          replacement = """        Map<String, App> byPkg = new HashMap<>();
-
-                  Intent tvQuery = new Intent(Intent.ACTION_MAIN)
-                          .addCategory(Intent.CATEGORY_LEANBACK_LAUNCHER);
-                  for (ResolveInfo ri : pm.queryIntentActivities(tvQuery, 0)) {
-                      addLaunchableApp(
-                              pm, byPkg, ri, Intent.CATEGORY_LEANBACK_LAUNCHER);
-                  }
-
-                  Intent mobileQuery = new Intent(Intent.ACTION_MAIN)
-                          .addCategory(Intent.CATEGORY_LAUNCHER);
-                  for (ResolveInfo ri : pm.queryIntentActivities(mobileQuery, 0)) {
-                      addLaunchableApp(
-                              pm, byPkg, ri, Intent.CATEGORY_LAUNCHER);
-                  }
-
-                  List<App> dock = new ArrayList<>();"""
-
-          s, count = pattern.subn(replacement, s, count=1)
           if count != 1:
               raise SystemExit(
-                  "App discovery block not found; refusing to patch wrong code."
+                  "Не удалось найти блок баннера в MainActivity.java"
               )
 
-          helper = """    private void addLaunchableApp(
-            PackageManager pm, Map<String, App> byPkg,
-            ResolveInfo ri, String category) {
-        ActivityInfo ai = ri.activityInfo;
-        if (ai == null || hidden.contains(ai.packageName)
-                || byPkg.containsKey(ai.packageName)) {
-            return;
-        }
-
-        App a = new App();
-        a.pkg = ai.packageName;
-        a.label = String.valueOf(ri.loadLabel(pm));
-        a.component = new ComponentName(ai.packageName, ai.name);
-        a.launchCategory = category;
-
-        Drawable banner = ai.loadBanner(pm);
-        if (banner == null) {
-            banner = ai.applicationInfo.loadBanner(pm);
-        }
-
-        a.isBanner = banner != null;
-        a.art = banner != null ? banner : ri.loadIcon(pm);
-        a.color = sampleColor(a.pkg, a.art);
-        byPkg.put(ai.packageName, a);
-    }
-
-"""
-
-          # Insert helper before tile creation, regardless of nearby comments.
-          tile_pattern = re.compile(r"(?m)^    private (?:View|LinearLayout|FrameLayout)\s+tile\s*\(")
-          matches = list(tile_pattern.finditer(s))
-          if len(matches) != 1:
-              raise SystemExit(
-                  f"Tile method marker: expected one match, found {len(matches)}."
-              )
-          pos = matches[0].start()
-          s = s[:pos] + helper + s[pos:]
-
-          # Launch each app with the category used to discover it.
-          old_launch = (
-              ".addCategory(Intent.CATEGORY_LEANBACK_LAUNCHER)\n"
-              "                .setComponent(app.component)"
-          )
-          replace_exact(
-              old_launch,
-              ".addCategory(app.launchCategory)\n"
-              "                .setComponent(app.component)",
-              "Launch category"
-          )
-
-          # Preserve focus effects while making them slightly quicker.
-          s = s.replace(
-              ".setInterpolator(has ? new OvershootInterpolator(1.8f) "
-              ": new DecelerateInterpolator())\n"
-              "                .setDuration(has ? 320 : 200).start();",
-              ".setInterpolator(new DecelerateInterpolator())\n"
-              "                .setDuration(has ? 220 : 160).start();"
-          )
-          s = s.replace(
-              "shine.animate().alpha(has ? 1f : 0f).setDuration(160).start();",
-              "shine.animate().alpha(has ? 1f : 0f).setDuration(120).start();"
-          )
-          s = s.replace(
-              ".translationY(has ? dp(4) : 0).setDuration(200).start();",
-              ".translationY(has ? dp(4) : 0).setDuration(150).start();"
-          )
-
-          java.write_text(s)
-
-          # Allow queries for both Android TV and standard launcher activities.
-          xml = manifest.read_text()
-          if "</queries>" not in xml:
-              raise SystemExit("AndroidManifest.xml has no </queries> section.")
-
-          if "android.intent.category.LAUNCHER" not in xml:
-              xml = xml.replace(
-                  "</queries>",
-                  """    <intent>
-                      <action android:name="android.intent.action.MAIN" />
-                      <category android:name="android.intent.category.LAUNCHER" />
-                  </intent>
-          </queries>""",
-                  1
-              )
-          manifest.write_text(xml)
-
-          # Target Android 8.0+ (API 26) where supported by this project.
-          sh = build_script.read_text()
-          sh = sh.replace("--min-sdk-version 30", "--min-sdk-version 26")
-          sh = sh.replace("--min-api 30", "--min-api 26")
-          build_script.write_text(sh)
-
-          print("Source patch completed.")
+          path.write_text(content)
+          print("YouTube будет использовать обычную иконку.")
           PY
 
       - name: Build APK
         working-directory: source/launcher
         run: bash build-and-install.sh --build
 
-      - name: Verify APK exists
-        shell: bash
+      - name: Check APK
         run: |
-          set -euo pipefail
           test -s source/launcher/build/tvhome.apk
-          file source/launcher/build/tvhome.apk
           ls -lh source/launcher/build/tvhome.apk
 
-      - name: Upload APK
+      - name: Save APK
         uses: actions/upload-artifact@v4
         with:
           name: tvhome-apk
           path: source/launcher/build/tvhome.apk
           if-no-files-found: error
-          retention-days: 7
