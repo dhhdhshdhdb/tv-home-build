@@ -1,3 +1,4 @@
+
 name: Build TV Home APK
 
 on:
@@ -52,6 +53,30 @@ jobs:
 
           path.write_text(content)
           print("Минимальная версия Android изменена на API 26.")
+          PY
+
+      - name: Fix YouTube tile banner
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path("source/launcher/src/com/mihir/tvhome/MainActivity.java")
+          content = path.read_text()
+
+          old = """            a.isBanner = banner != null;
+            a.art = banner != null ? banner : ri.loadIcon(pm);"""
+
+          new = """            if ("com.google.android.youtube.tv".equals(ai.packageName)
+                    || "com.google.android.youtube".equals(ai.packageName)) {
+                banner = null;
+            }
+            a.isBanner = banner != null;
+            a.art = banner != null ? banner : ri.loadIcon(pm);"""
+
+          if old not in content:
+              raise SystemExit("Не найдена строка для исправления YouTube.")
+          path.write_text(content.replace(old, new, 1))
+          print("Для YouTube включено использование обычной иконки.")
           PY
 
       - name: Build APK
