@@ -32,9 +32,36 @@ jobs:
       - name: Install Android tools
         run: sdkmanager "platforms;android-34" "build-tools;34.0.0"
 
-      - name: Build APK only
+      - name: Lower minimum Android version
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path("source/launcher/build-and-install.sh")
+          content = path.read_text()
+
+          replacements = {
+              "--min-sdk-version 30": "--min-sdk-version 26",
+              "--min-api 30": "--min-api 26",
+          }
+
+          for old, new in replacements.items():
+              if old not in content:
+                  raise SystemExit(f"Не найдена ожидаемая настройка: {old}")
+              content = content.replace(old, new)
+
+          path.write_text(content)
+          print("Минимальная версия Android изменена на API 26.")
+          PY
+
+      - name: Build APK
         working-directory: source/launcher
         run: bash build-and-install.sh --build
+
+      - name: Check APK
+        run: |
+          test -s source/launcher/build/tvhome.apk
+          ls -lh source/launcher/build/tvhome.apk
 
       - name: Save APK
         uses: actions/upload-artifact@v4
