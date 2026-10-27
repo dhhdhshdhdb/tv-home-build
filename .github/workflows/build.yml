@@ -1,0 +1,44 @@
+name: Build TV Home APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download source
+        uses: actions/checkout@v4
+        with:
+          repository: mihirgupta0900/tv-home
+          path: source
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android tools
+        run: sdkmanager "platforms;android-34" "build-tools;34.0.0"
+
+      - name: Build APK only
+        working-directory: source/launcher
+        run: bash build-and-install.sh --build
+
+      - name: Save APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: tvhome-apk
+          path: source/launcher/build/tvhome.apk
+          if-no-files-found: error
