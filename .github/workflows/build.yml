@@ -1,3 +1,4 @@
+
 name: Build TV Home APK
 
 on:
@@ -55,39 +56,49 @@ jobs:
         run: |
           python3 - <<'PY'
           from pathlib import Path
+          import re
 
           path = Path(
               "source/launcher/src/com/mihir/tvhome/MainActivity.java"
           )
-          content = path.read_text()
+          content = path.read_text(encoding="utf-8")
 
           class_marker = "public class MainActivity extends Activity {"
           constant = (
-              'public class MainActivity extends Activity {\n'
-              '    private static final String HIDDEN_APP_KEYWORD = "youtube";'
+              class_marker
+              + '\n    private static final String HIDDEN_APP_KEYWORD = "youtube";'
           )
 
           if "private static final String HIDDEN_APP_KEYWORD" not in content:
               if content.count(class_marker) != 1:
-                  raise SystemExit("Could not locate MainActivity class declaration.")
+                  raise SystemExit(
+                      "ERROR: could not uniquely locate MainActivity class."
+                  )
               content = content.replace(class_marker, constant, 1)
 
-          marker = "          ActivityInfo ai = ri.activityInfo;"
-          filter_code = '''          ActivityInfo ai = ri.activityInfo;
-                    String packageName = ai.packageName == null
-                            ? ""
-                            : ai.packageName.toLowerCase(Locale.ROOT);
-                    if (packageName.contains(HIDDEN_APP_KEYWORD)) {
-                        continue;
-                    }'''
+          pattern = re.compile(
+              r"(?m)^([ \t]*)ActivityInfo ai = ri\.activityInfo;"
+          )
 
           if "packageName.contains(HIDDEN_APP_KEYWORD)" not in content:
-              if content.count(marker) != 1:
-                  raise SystemExit("Could not locate app enumeration block.")
-              content = content.replace(marker, filter_code, 1)
+              replacement = (
+                  r"\1ActivityInfo ai = ri.activityInfo;\n"
+                  r"\1String packageName = ai.packageName == null "
+                  r'? "" : ai.packageName.toLowerCase(Locale.ROOT);\n'
+                  r"\1if (packageName.contains(HIDDEN_APP_KEYWORD)) {\n"
+                  r"\1    continue;\n"
+                  r"\1}"
+              )
+              content, count = pattern.subn(replacement, content, count=1)
 
-          path.write_text(content)
-          print("YouTube app entries will be skipped before tile creation.")
+              if count != 1:
+                  raise SystemExit(
+                      "ERROR: could not locate app enumeration block; "
+                      "source was not patched."
+                  )
+
+          path.write_text(content, encoding="utf-8")
+          print("YouTube package filter applied.")
           PY
 
       - name: Build APK
