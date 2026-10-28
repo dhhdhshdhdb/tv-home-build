@@ -69,7 +69,7 @@ jobs:
           from pathlib import Path
 
           path = Path("source/launcher/build-and-install.sh")
-          text = path.read_text(encoding="utf-8")
+          content = path.read_text(encoding="utf-8")
 
           replacements = {
               "--min-sdk-version 30": "--min-sdk-version 26",
@@ -77,19 +77,19 @@ jobs:
           }
 
           for old, new in replacements.items():
-              count = text.count(old)
+              count = content.count(old)
               if count != 1:
                   raise SystemExit(
-                      f"Expected exactly one occurrence of {old!r}; found {count}."
+                      f"Expected exactly one occurrence of {old!r}; found {count}"
                   )
-              text = text.replace(old, new, 1)
+              content = content.replace(old, new, 1)
 
-          if "--min-sdk-version 26" not in text:
-              raise SystemExit("Minimum SDK patch verification failed.")
-          if "--min-api 26" not in text:
-              raise SystemExit("DEX minimum API patch verification failed.")
+          if "--min-sdk-version 26" not in content:
+              raise SystemExit("Minimum SDK patch verification failed")
+          if "--min-api 26" not in content:
+              raise SystemExit("DEX minimum API patch verification failed")
 
-          path.write_text(text, encoding="utf-8")
+          path.write_text(content, encoding="utf-8")
           print("Verified: min SDK = 26; DEX min API = 26.")
           PY
 
@@ -102,47 +102,179 @@ jobs:
           import re
 
           path = Path("source/launcher/res/values/config.xml")
-          text = path.read_text(encoding="utf-8")
+          content = path.read_text(encoding="utf-8")
 
           pattern = re.compile(
               r'(<string-array name="hidden_apps">)(.*?)(</string-array>)',
               re.S,
           )
-          match = pattern.search(text)
+          match = pattern.search(content)
+
           if not match:
               raise SystemExit("ERROR: hidden_apps array not found")
 
           body = match.group(2)
           package = "com.google.android.youtube.tv"
 
-          if not re.search(
-              r"<item>\s*" + re.escape(package) + r"\s*</item>",
-              body,
-          ):
+          item_pattern = re.compile(
+              r"<item>\s*" + re.escape(package) + r"\s*</item>"
+          )
+
+          if not item_pattern.search(body):
               body += f"\n        <item>{package}</item>\n    "
 
-          text = text[:match.start(2)] + body + text[match.end(2):]
-          path.write_text(text, encoding="utf-8")
-
-          check = path.read_text(encoding="utf-8")
-          hidden = re.search(
-              r'<string-array name="hidden_apps">(.*?)</string-array>',
-              check,
-              re.S,
+          content = (
+              content[:match.start(2)]
+              + body
+              + content[match.end(2):]
           )
-          if not hidden or f"<item>{package}</item>" not in hidden.group(1):
-              raise SystemExit("ERROR: YouTube was not added to hidden_apps")
+          path.write_text(content, encoding="utf-8")
 
-          print("OK: YouTube added to hidden_apps")
-          print(hidden.group(0))
+          print("YouTube hidden-app configuration patched.")
+          PY
+
+      - name: Diagnose config and instrument app
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "=== FULL CONFIG ==="
+          cat source/launcher/res/values/config.xml
+
+          echo "=== PARSE XML ==="
+          python3 - <<'PY'
+          import xml.etree.ElementTree as ET
+          from pathlib import Path
+
+          path = Path("source/launcher/res/values/config.xml")
+          root = ET.parse(path).getroot()
+
+          for name in ("dock_apps", "hidden_apps"):
+              node = root.find(f"string-array[@name='{name}']")
+              if node is None:
+                  raise SystemExit(f"ERROR: missing array {name}")
+
+              values = [
+                  item.text or ""
+                  for item in node.findall("item")
+              ]
+
+              print(f"{name}: count={len(values)} values={values}")
+
+              if any("*" in value or ".*" in value for value in values):
+                  raise SystemExit(f"ERROR: wildcard found in {name}")
+
+          hidden_node = root.find(
+              "string-array[@name='hidden_apps']"
+          )
+          hidden_values = [
+              item.text or ""
+              for item in hidden_node.findall("item")
+          ]
+
+          youtube = "com.google.android.youtube.tv"
+
+          if hidden_values.count(youtube) != 1:
+              raise SystemExit(
+                  "ERROR: YouTube must occur exactly once in hidden_apps; "
+                  f"found {hidden_values.count(youtube)}"
+              )
+
+          print("XML DIAGNOSTICS OK")
+          PY
+
+          echo "=== INSTRUMENT JAVA ==="
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path(
+              "source/launcher/src/com/mihir/tvhome/MainActivity.java"
+          )
+          content = path.read_text(encoding="utf-8")
+
+          if "TVHomeDiag" in content:
+              raise SystemExit(
+                  "ERROR: TVHomeDiag instrumentation already exists in source"
+              )
+
+          replacements = [
+              (
+                  "import android.util.TypedValue;",
+                  "import android.util.TypedValue;\n"
+                  "import android.util.Log;"
+              ),
+              (
+                  "hidden.add(getPackageName());",
+                  "hidden.add(getPackageName());\n"
+                  '        Log.i("TVHomeDiag", "CONFIG hiddenApps=" + hidden);\n'
+                  '        Log.i("TVHomeDiag", "CONFIG dockApps=" + '
+                  "java.util.Arrays.toString(dockApps));"
+              ),
+              (
+                  "for (ResolveInfo ri : pm.queryIntentActivities(q, 0)) {",
+                  "List<ResolveInfo> diagnosticResults = "
+                  "pm.queryIntentActivities(q, 0);\n"
+                  '        Log.i("TVHomeDiag", "QUERY count=" + '
+                  "diagnosticResults.size());\n"
+                  "        for (ResolveInfo ri : diagnosticResults) {"
+              ),
+              (
+                  "if (hidden.contains(ai.packageName) || "
+                  "byPkg.containsKey(ai.packageName)) continue;",
+                  "if (hidden.contains(ai.packageName)) {\n"
+                  '                Log.i("TVHomeDiag", "FILTERED hidden=" + '
+                  "ai.packageName);\n"
+                  "                continue;\n"
+                  "            }\n"
+                  "            if (byPkg.containsKey(ai.packageName)) continue;"
+              ),
+              (
+                  "List<App> rest = new ArrayList<>(byPkg.values());",
+                  'Log.i("TVHomeDiag", "DOCK count=" + dock.size());\n'
+                  '        Log.i("TVHomeDiag", "DOCK packages=" + '
+                  "dock.stream().map(a -> a.pkg).collect("
+                  "java.util.stream.Collectors.toList()));\n"
+                  "        List<App> rest = new ArrayList<>(byPkg.values());"
+              ),
+              (
+                  "Collections.sort(rest, (x, y) -> "
+                  "x.label.compareToIgnoreCase(y.label));",
+                  "Collections.sort(rest, (x, y) -> "
+                  "x.label.compareToIgnoreCase(y.label));\n"
+                  '        Log.i("TVHomeDiag", "GRID count=" + rest.size());\n'
+                  '        Log.i("TVHomeDiag", "GRID packages=" + '
+                  "rest.stream().map(a -> a.pkg).collect("
+                  "java.util.stream.Collectors.toList()));"
+              ),
+          ]
+
+          for old, new in replacements:
+              count = content.count(old)
+
+              if count != 1:
+                  raise SystemExit(
+                      "ERROR: expected exactly one Java match, "
+                      f"found {count}: {old}"
+                  )
+
+              content = content.replace(old, new, 1)
+
+          path.write_text(content, encoding="utf-8")
+          print("JAVA DIAGNOSTICS INSTRUMENTED")
           PY
 
       - name: Verify patched source
         shell: bash
         run: |
           set -euo pipefail
+
+          echo "=== Hidden apps config ==="
           grep -n -A 10 'name="hidden_apps"' \
             source/launcher/res/values/config.xml
+
+          echo "=== Diagnostic instrumentation ==="
+          grep -n 'TVHomeDiag' \
+            source/launcher/src/com/mihir/tvhome/MainActivity.java
 
           if grep -q 'HIDDEN_APP_KEYWORD' \
             source/launcher/src/com/mihir/tvhome/MainActivity.java; then
@@ -153,7 +285,7 @@ jobs:
           grep -nE -- '--min-sdk-version 26|--min-api 26' \
             source/launcher/build-and-install.sh
 
-          echo "OK: native config verified"
+          echo "OK: source verification complete"
 
       - name: Build APK
         working-directory: source/launcher
