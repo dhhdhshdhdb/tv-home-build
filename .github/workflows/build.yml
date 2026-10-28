@@ -53,40 +53,58 @@ jobs:
           print("Минимальная версия Android: API 26")
           PY
 
-      - name: Fix YouTube tile banner
+      - name: Fix YouTube tile and focus overlap
         run: |
           python3 - <<'PY'
           from pathlib import Path
           import re
 
-          path = Path(
-              "source/launcher/src/com/mihir/tvhome/MainActivity.java"
-          )
+          path = Path("source/launcher/src/com/mihir/tvhome/MainActivity.java")
           content = path.read_text()
 
-          pattern = (
+          banner_pattern = (
               r'(?m)^([ \t]*)a\.isBanner = banner != null;\s*\n'
               r'[ \t]*a\.art = banner != null \? banner : ri\.loadIcon\(pm\);'
           )
 
-          replacement = r'''\1if ("com.google.android.youtube.tv".equals(ai.packageName)
-          \1        || "com.google.android.youtube".equals(ai.packageName)) {
+          banner_replacement = r'''\1if (
+          \1        ai.packageName.toLowerCase().contains("youtube")
+          \1        || a.label.toLowerCase().contains("youtube")) {
           \1    banner = null;
           \1}
           \1a.isBanner = banner != null;
           \1a.art = banner != null ? banner : ri.loadIcon(pm);'''
 
-          content, count = re.subn(
-              pattern, replacement, content, count=1
+          content, banner_count = re.subn(
+              banner_pattern, banner_replacement, content, count=1
           )
 
-          if count != 1:
-              raise SystemExit(
-                  "Не удалось найти блок баннера в MainActivity.java"
-              )
+          if banner_count != 1:
+              raise SystemExit("Не найден блок выбора баннера YouTube")
+
+          focus_pattern = (
+              r'(?s)        card\.setOnFocusChangeListener\(\(v, has\) -> \{\n'
+              r'            float s = has \? \(inDock \? 1\.12f : 1\.1f\) : 1f;.*?'
+              r'            shine\.animate\(\)\.alpha\(has \? 1f : 0f\)'
+              r'\.setDuration\(160\)\.start\(\);'
+          )
+
+          focus_replacement = '''        card.setOnFocusChangeListener((v, has) -> {
+              // Stable bounds prevent focus animation from covering nearby tiles.
+              v.setScaleX(1f);
+              v.setScaleY(1f);
+              v.setTranslationZ(0f);
+              shine.animate().alpha(has ? 1f : 0f).setDuration(160).start();'''
+
+          content, focus_count = re.subn(
+              focus_pattern, focus_replacement, content, count=1
+          )
+
+          if focus_count != 1:
+              raise SystemExit("Не найден обработчик масштаба плитки")
 
           path.write_text(content)
-          print("YouTube будет использовать обычную иконку.")
+          print("YouTube banner disabled; focus overlap fix applied.")
           PY
 
       - name: Build APK
