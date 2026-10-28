@@ -12,14 +12,23 @@ permissions:
 
 jobs:
   build:
+    name: Patch and build APK
     runs-on: ubuntu-latest
+    timeout-minutes: 20
 
     steps:
-      - name: Download source
+      - name: Checkout build repository
+        uses: actions/checkout@v4
+        with:
+          path: build-repo
+
+      - name: Checkout pinned upstream source
         uses: actions/checkout@v4
         with:
           repository: mihirgupta0900/tv-home
+          ref: 19803542cd335e0b2643dfa73c18c38051354ffa
           path: source
+          persist-credentials: false
 
       - name: Set up Java
         uses: actions/setup-java@v4
@@ -30,30 +39,73 @@ jobs:
       - name: Set up Android SDK
         uses: android-actions/setup-android@v4
 
-      - name: Install Android tools
-        run: sdkmanager "platforms;android-34" "build-tools;34.0.0"
-
-      - name: Lower minimum Android version
+      - name: Install Android SDK tools
+        shell: bash
         run: |
+          set -euo pipefail
+          sdkmanager "platforms;android-34" "build-tools;34.0.0"
+
+      - name: Inspect build script
+        working-directory: source/launcher
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          test -f build-and-install.sh
+
+          echo "=== Build script ==="
+          sed -n '1,180p' build-and-install.sh
+
+          echo "=== Relevant commands ==="
+          grep -nE 'adb|git checkout|git reset|git clean|tv\.py|aapt2|javac|d8|zipalign|apksigner|--build' \
+            build-and-install.sh || true
+
+          echo "=== Required build-only exit ==="
+          grep -F '[ "${1:-}" = "--build" ] && exit 0' \
+            build-and-install.sh
+
+          echo "Build-only guard verified."
+
+      - name: Patch minimum Android API
+        shell: bash
+        run: |
+          set -euo pipefail
+
           python3 - <<'PY'
           from pathlib import Path
 
           path = Path("source/launcher/build-and-install.sh")
-          content = path.read_text()
+          text = path.read_text(encoding="utf-8")
 
-          for old, new in [
-              ("--min-sdk-version 30", "--min-sdk-version 26"),
-              ("--min-api 30", "--min-api 26"),
-          ]:
-              if old in content:
-                  content = content.replace(old, new)
+          replacements = {
+              "--min-sdk-version 30": "--min-sdk-version 26",
+              "--min-api 30": "--min-api 26",
+          }
 
-          path.write_text(content)
-          print("Minimum Android version set to API 26 where applicable.")
+          for old, new in replacements.items():
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(
+                      f"Expected exactly one occurrence of {old!r}; found {count}. "
+                      "Refusing to patch an unexpected source version."
+                  )
+              text = text.replace(old, new, 1)
+
+          if "--min-sdk-version 26" not in text:
+              raise SystemExit("Minimum SDK patch verification failed.")
+
+          if "--min-api 26" not in text:
+              raise SystemExit("DEX minimum API patch verification failed.")
+
+          path.write_text(text, encoding="utf-8")
+          print("Verified: min SDK = 26; DEX min API = 26.")
           PY
 
-      - name: Remove YouTube tile
+      - name: Hide YouTube tile
+        shell: bash
         run: |
+          set -euo pipefail
+
           python3 - <<'PY'
           from pathlib import Path
           import re
@@ -61,59 +113,208 @@ jobs:
           path = Path(
               "source/launcher/src/com/mihir/tvhome/MainActivity.java"
           )
-          content = path.read_text(encoding="utf-8")
+          text = path.read_text(encoding="utf-8")
 
-          class_marker = "public class MainActivity extends Activity {"
-          constant = (
-              class_marker
-              + '\n    private static final String HIDDEN_APP_KEYWORD = "youtube";'
+          class_pattern = re.compile(
+              r"\bpublic\s+class\s+MainActivity\s+extends\s+Activity\s*\{"
           )
+          classes = list(class_pattern.finditer(text))
 
-          if "private static final String HIDDEN_APP_KEYWORD" not in content:
-              if content.count(class_marker) != 1:
-                  raise SystemExit(
-                      "ERROR: could not uniquely locate MainActivity class."
-                  )
-              content = content.replace(class_marker, constant, 1)
-
-          pattern = re.compile(
-              r"(?m)^([ \t]*)ActivityInfo ai = ri\.activityInfo;"
-          )
-
-          if "packageName.contains(HIDDEN_APP_KEYWORD)" not in content:
-              replacement = (
-                  r"\1ActivityInfo ai = ri.activityInfo;\n"
-                  r"\1String packageName = ai.packageName == null "
-                  r'? "" : ai.packageName.toLowerCase(Locale.ROOT);\n'
-                  r"\1if (packageName.contains(HIDDEN_APP_KEYWORD)) {\n"
-                  r"\1    continue;\n"
-                  r"\1}"
+          if len(classes) != 1:
+              raise SystemExit(
+                  f"Expected one MainActivity class; found {len(classes)}."
               )
-              content, count = pattern.subn(replacement, content, count=1)
 
-              if count != 1:
+          constant_name = "HIDDEN_APP_KEYWORD"
+          constant_line = (
+              '    private static final String HIDDEN_APP_KEYWORD = "youtube";'
+          )
+
+          if text.count(constant_name) == 0:
+              insert_at = classes[0].end()
+              text = text[:insert_at] + "\n" + constant_line + text[insert_at:]
+          elif text.count(constant_name) != 1:
+              raise SystemExit("Ambiguous existing YouTube filter constant.")
+
+          if "import java.util.Locale;" not in text:
+              raise SystemExit(
+                  "Expected java.util.Locale import; refusing unsafe Java patch."
+              )
+
+          loop_pattern = re.compile(
+              r"for\s*\(\s*ResolveInfo\s+ri\s*:\s*"
+              r"pm\.queryIntentActivities\s*\(\s*q\s*,\s*0\s*\)\s*\)\s*\{"
+          )
+          loops = list(loop_pattern.finditer(text))
+
+          if len(loops) != 1:
+              raise SystemExit(
+                  f"Expected one target app-enumeration loop; found {len(loops)}."
+              )
+
+          # Find the matching closing brace while ignoring braces in Java
+          # strings, character literals and comments.
+          opening = loops[0].end() - 1
+          depth = 1
+          i = opening + 1
+          state = "code"
+
+          while i < len(text) and depth:
+              c = text[i]
+              nxt = text[i + 1] if i + 1 < len(text) else ""
+
+              if state == "code":
+                  if c == "/" and nxt == "/":
+                      state = "line_comment"
+                      i += 2
+                      continue
+                  if c == "/" and nxt == "*":
+                      state = "block_comment"
+                      i += 2
+                      continue
+                  if c == '"':
+                      state = "string"
+                  elif c == "'":
+                      state = "char"
+                  elif c == "{":
+                      depth += 1
+                  elif c == "}":
+                      depth -= 1
+              elif state == "line_comment":
+                  if c == "\n":
+                      state = "code"
+              elif state == "block_comment":
+                  if c == "*" and nxt == "/":
+                      state = "code"
+                      i += 2
+                      continue
+              elif state in ("string", "char"):
+                  if c == "\\":
+                      i += 2
+                      continue
+                  if (state == "string" and c == '"') or (
+                      state == "char" and c == "'"
+                  ):
+                      state = "code"
+
+              i += 1
+
+          if depth != 0:
+              raise SystemExit("Could not determine target loop boundaries.")
+
+          body_start = opening + 1
+          body_end = i - 1
+          body = text[body_start:body_end]
+
+          ai_pattern = re.compile(
+              r"(?m)^[ \t]*ActivityInfo\s+ai\s*=\s*ri\.activityInfo\s*;"
+          )
+          declarations = list(ai_pattern.finditer(body))
+
+          filter_pattern = re.compile(
+              r"packageName\.contains\s*\(\s*HIDDEN_APP_KEYWORD\s*\)"
+          )
+          existing_filters = list(filter_pattern.finditer(body))
+
+          if len(declarations) != 1:
+              if len(existing_filters) == 1 and len(declarations) == 0:
                   raise SystemExit(
-                      "ERROR: could not locate app enumeration block; "
-                      "source was not patched."
+                      "Filter exists but ActivityInfo declaration was not found. "
+                      "Refusing to assume the patch is correct."
+                  )
+              raise SystemExit(
+                  f"Expected one ActivityInfo declaration in target loop; "
+                  f"found {len(declarations)}."
+              )
+
+          if existing_filters:
+              if len(existing_filters) != 1:
+                  raise SystemExit("Multiple YouTube filters found in target loop.")
+
+              filter_pos = existing_filters[0].start()
+              declaration_pos = declarations[0].start()
+
+              if filter_pos < declaration_pos:
+                  raise SystemExit(
+                      "Existing YouTube filter is before ActivityInfo declaration."
                   )
 
-          path.write_text(content, encoding="utf-8")
-          print("YouTube package filter applied.")
+              print("YouTube filter already exists in target loop.")
+          else:
+              if "HIDDEN_APP_KEYWORD" not in text:
+                  raise SystemExit("YouTube filter constant is missing.")
+
+              declaration = declarations[0]
+              indent = re.match(r"[ \t]*", declaration.group()).group()
+
+              patch = (
+                  declaration.group()
+                  + "\n"
+                  + indent
+                  + 'String packageName = ai.packageName == null ? "" : '
+                    "ai.packageName.toLowerCase(Locale.ROOT);\n"
+                  + indent
+                  + "if (packageName.contains(HIDDEN_APP_KEYWORD)) {\n"
+                  + indent
+                  + "    continue;\n"
+                  + indent
+                  + "}"
+              )
+
+              absolute_start = body_start + declaration.start()
+              absolute_end = body_start + declaration.end()
+              text = text[:absolute_start] + patch + text[absolute_end:]
+
+          # Final assertions: exactly one filter in the target loop and
+          # no accidental duplicate declaration of the constant.
+          if text.count(constant_name) != 1:
+              raise SystemExit("Final constant count verification failed.")
+
+          path.write_text(text, encoding="utf-8")
+
+          print("YouTube filter patch applied and verified.")
           PY
+
+      - name: Verify patched source
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          grep -n -A 12 -B 3 \
+            'ActivityInfo ai = ri.activityInfo' \
+            source/launcher/src/com/mihir/tvhome/MainActivity.java
+
+          grep -n 'HIDDEN_APP_KEYWORD' \
+            source/launcher/src/com/mihir/tvhome/MainActivity.java
+
+          grep -nE -- '--min-sdk-version 26|--min-api 26' \
+            source/launcher/build-and-install.sh
 
       - name: Build APK
         working-directory: source/launcher
-        run: bash build-and-install.sh --build
-
-      - name: Check APK
+        shell: bash
         run: |
-          test -s source/launcher/build/tvhome.apk
-          ls -lh source/launcher/build/tvhome.apk
+          set -euo pipefail
+          bash build-and-install.sh --build
 
-      - name: Save APK
+      - name: Verify APK and calculate SHA-256
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          APK="source/launcher/build/tvhome.apk"
+
+          test -s "$APK"
+          file "$APK"
+          sha256sum "$APK" | tee source/launcher/build/SHA256SUMS.txt
+          ls -lh "$APK"
+
+      - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
           name: tvhome-apk
-          path: source/launcher/build/tvhome.apk
+          path: |
+            source/launcher/build/tvhome.apk
+            source/launcher/build/SHA256SUMS.txt
           if-no-files-found: error
           retention-days: 7
