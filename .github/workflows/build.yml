@@ -50,27 +50,21 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-
           test -f build-and-install.sh
-
           echo "=== Build script ==="
           sed -n '1,180p' build-and-install.sh
-
           echo "=== Relevant commands ==="
           grep -nE 'adb|git checkout|git reset|git clean|tv\.py|aapt2|javac|d8|zipalign|apksigner|--build' \
             build-and-install.sh || true
-
           echo "=== Required build-only exit ==="
           grep -F '[ "${1:-}" = "--build" ] && exit 0' \
             build-and-install.sh
-
           echo "Build-only guard verified."
 
       - name: Patch minimum Android API
         shell: bash
         run: |
           set -euo pipefail
-
           python3 - <<'PY'
           from pathlib import Path
 
@@ -92,7 +86,6 @@ jobs:
 
           if "--min-sdk-version 26" not in text:
               raise SystemExit("Minimum SDK patch verification failed.")
-
           if "--min-api 26" not in text:
               raise SystemExit("DEX minimum API patch verification failed.")
 
@@ -100,238 +93,67 @@ jobs:
           print("Verified: min SDK = 26; DEX min API = 26.")
           PY
 
-      - name: Hide YouTube tile
+      - name: Hide YouTube via native config
         shell: bash
         run: |
           set -euo pipefail
-
           python3 - <<'PY'
-          import re
           from pathlib import Path
+          import re
 
-          path = Path("source/launcher/src/com/mihir/tvhome/MainActivity.java")
+          path = Path("source/launcher/res/values/config.xml")
           text = path.read_text(encoding="utf-8")
 
-          # Locate MainActivity exactly once.
-          class_pattern = re.compile(
-              r"\bpublic\s+class\s+MainActivity\s+extends\s+Activity\s*\{"
+          pattern = re.compile(
+              r'(<string-array name="hidden_apps">)(.*?)(</string-array>)',
+              re.S,
           )
-          classes = list(class_pattern.finditer(text))
+          match = pattern.search(text)
+          if not match:
+              raise SystemExit("ERROR: hidden_apps array not found")
 
-          if len(classes) != 1:
-              raise SystemExit(
-                  f"Expected one MainActivity class; found {len(classes)}."
-              )
-
-          # Ensure Locale is imported. Insert it after the package declaration.
-          locale_import = "import java.util.Locale;"
-          if not re.search(
-              r"(?m)^\s*import\s+java\.util\.Locale\s*;",
-              text
-          ):
-              package_match = re.search(
-                  r"(?m)^package\s+[^;]+;",
-                  text
-              )
-              if not package_match:
-                  raise SystemExit("Package declaration not found.")
-
-              pos = package_match.end()
-              text = (
-                  text[:pos]
-                  + "\n\n"
-                  + locale_import
-                  + text[pos:]
-              )
-
-          # Match the complete constant declaration, not all its references.
-          constant_line = (
-              '    private static final String HIDDEN_APP_KEYWORD = "youtube";'
-          )
-          constant_pattern = re.compile(
-              r'(?m)^[ \t]*private\s+static\s+final\s+String\s+'
-              r'HIDDEN_APP_KEYWORD\s*=\s*"youtube"\s*;[ \t]*$'
-          )
-          constants = list(constant_pattern.finditer(text))
-
-          if len(constants) == 0:
-              # Re-find the class after any import insertion.
-              classes = list(class_pattern.finditer(text))
-              if len(classes) != 1:
-                  raise SystemExit("MainActivity class verification failed.")
-
-              pos = classes[0].end()
-              text = text[:pos] + "\n" + constant_line + text[pos:]
-          elif len(constants) != 1:
-              raise SystemExit("Multiple HIDDEN_APP_KEYWORD declarations found.")
-
-          # Find the application-enumeration loop.
-          loop_pattern = re.compile(
-              r"for\s*\(\s*ResolveInfo\s+ri\s*:\s*"
-              r"pm\.queryIntentActivities\s*\(\s*q\s*,\s*0\s*\)\s*\)\s*\{"
-          )
-          filter_pattern = re.compile(
-              r"packageName\.contains\s*\(\s*HIDDEN_APP_KEYWORD\s*\)"
-          )
-          ai_pattern = re.compile(
-              r"(?m)^[ \t]*ActivityInfo\s+ai\s*=\s*ri\.activityInfo\s*;"
-          )
-
-          def find_matching_brace(source, opening):
-              """Find a Java closing brace while skipping comments and literals."""
-              depth = 1
-              i = opening + 1
-              state = "code"
-
-              while i < len(source) and depth:
-                  ch = source[i]
-                  nxt = source[i + 1] if i + 1 < len(source) else ""
-
-                  if state == "code":
-                      if ch == "/" and nxt == "/":
-                          state = "line_comment"
-                          i += 2
-                          continue
-                      if ch == "/" and nxt == "*":
-                          state = "block_comment"
-                          i += 2
-                          continue
-                      if ch == '"':
-                          state = "string"
-                      elif ch == "'":
-                          state = "char"
-                      elif ch == "{":
-                          depth += 1
-                      elif ch == "}":
-                          depth -= 1
-                  elif state == "line_comment":
-                      if ch == "\n":
-                          state = "code"
-                  elif state == "block_comment":
-                      if ch == "*" and nxt == "/":
-                          state = "code"
-                          i += 2
-                          continue
-                  elif state in ("string", "char"):
-                      if ch == "\\":
-                          i += 2
-                          continue
-                      if (
-                          state == "string" and ch == '"'
-                      ) or (
-                          state == "char" and ch == "'"
-                      ):
-                          state = "code"
-
-                  i += 1
-
-              if depth != 0:
-                  raise SystemExit("Could not determine target loop boundaries.")
-
-              return i - 1
-
-          def locate_target_loop(source):
-              loops = list(loop_pattern.finditer(source))
-              if len(loops) != 1:
-                  raise SystemExit(
-                      f"Expected one target app loop; found {len(loops)}."
-                  )
-
-              opening = loops[0].end() - 1
-              closing = find_matching_brace(source, opening)
-              return opening, closing
-
-          # Check the loop and its ActivityInfo declaration.
-          opening, closing = locate_target_loop(text)
-          body_start = opening + 1
-          body = text[body_start:closing]
-
-          declarations = list(ai_pattern.finditer(body))
-          filters = list(filter_pattern.finditer(body))
-
-          if len(declarations) != 1:
-              raise SystemExit(
-                  "Expected exactly one ActivityInfo declaration in target loop; "
-                  f"found {len(declarations)}."
-              )
-
-          if len(filters) > 1:
-              raise SystemExit("Multiple YouTube filters found in target loop.")
-
-          if len(filters) == 0:
-              declaration = declarations[0]
-              indent = re.match(r"[ \t]*", declaration.group()).group()
-
-              patch = (
-                  declaration.group()
-                  + "\n"
-                  + indent
-                  + 'String packageName = ai.packageName == null ? "" : '
-                    "ai.packageName.toLowerCase(Locale.ROOT);\n"
-                  + indent
-                  + "if (packageName.contains(HIDDEN_APP_KEYWORD)) {\n"
-                  + indent
-                  + "    continue;\n"
-                  + indent
-                  + "}"
-              )
-
-              absolute_start = body_start + declaration.start()
-              absolute_end = body_start + declaration.end()
-              text = text[:absolute_start] + patch + text[absolute_end:]
-
-          # Recalculate all positions after editing the source.
-          opening, closing = locate_target_loop(text)
-          body = text[opening + 1:closing]
-          declarations = list(ai_pattern.finditer(body))
-          filters = list(filter_pattern.finditer(body))
-          constants = list(constant_pattern.finditer(text))
-
-          if len(constants) != 1:
-              raise SystemExit(
-                  "Final constant declaration verification failed."
-              )
-
-          if len(declarations) != 1:
-              raise SystemExit(
-                  "Final ActivityInfo declaration verification failed."
-              )
-
-          if len(filters) != 1:
-              raise SystemExit("Final YouTube filter verification failed.")
-
-          if filters[0].start() < declarations[0].end():
-              raise SystemExit(
-                  "YouTube filter is not after the ActivityInfo declaration."
-              )
+          body = match.group(2)
+          package = "com.google.android.youtube.tv"
 
           if not re.search(
-              r"(?m)^\s*import\s+java\.util\.Locale\s*;",
-              text
+              r"<item>\s*" + re.escape(package) + r"\s*</item>",
+              body,
           ):
-              raise SystemExit("Locale import verification failed.")
+              body += f"\n        <item>{package}</item>\n    "
 
+          text = text[:match.start(2)] + body + text[match.end(2):]
           path.write_text(text, encoding="utf-8")
-          print("YouTube filter inserted and verified successfully.")
+
+          check = path.read_text(encoding="utf-8")
+          hidden = re.search(
+              r'<string-array name="hidden_apps">(.*?)</string-array>',
+              check,
+              re.S,
+          )
+          if not hidden or f"<item>{package}</item>" not in hidden.group(1):
+              raise SystemExit("ERROR: YouTube was not added to hidden_apps")
+
+          print("OK: YouTube added to hidden_apps")
+          print(hidden.group(0))
           PY
 
       - name: Verify patched source
         shell: bash
         run: |
           set -euo pipefail
+          grep -n -A 10 'name="hidden_apps"' \
+            source/launcher/res/values/config.xml
 
-          grep -n -A 12 -B 3 \
-            'ActivityInfo ai = ri.activityInfo' \
-            source/launcher/src/com/mihir/tvhome/MainActivity.java
-
-          grep -n 'HIDDEN_APP_KEYWORD' \
-            source/launcher/src/com/mihir/tvhome/MainActivity.java
-
-          grep -n 'import java.util.Locale;' \
-            source/launcher/src/com/mihir/tvhome/MainActivity.java
+          if grep -q 'HIDDEN_APP_KEYWORD' \
+            source/launcher/src/com/mihir/tvhome/MainActivity.java; then
+            echo "ERROR: old Java filter is still present"
+            exit 1
+          fi
 
           grep -nE -- '--min-sdk-version 26|--min-api 26' \
             source/launcher/build-and-install.sh
+
+          echo "OK: native config verified"
 
       - name: Build APK
         working-directory: source/launcher
@@ -340,7 +162,7 @@ jobs:
           set -euo pipefail
           bash build-and-install.sh --build
 
-      - name: Verify APK and calculate SHA-256
+      - name: Verify APK
         shell: bash
         run: |
           set -euo pipefail
