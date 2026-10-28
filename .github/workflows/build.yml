@@ -59,10 +59,15 @@ jobs:
           from pathlib import Path
           import re
 
-          path = Path("source/launcher/src/com/mihir/tvhome/MainActivity.java")
+          path = Path(
+              "source/launcher/src/com/mihir/tvhome/MainActivity.java"
+          )
           content = path.read_text()
 
-          pattern = r'(?m)^([ \t]*)a\.isBanner = banner != null;\s*\n[ \t]*a\.art = banner != null \? banner : ri\.loadIcon\(pm\);'
+          pattern = (
+              r'(?m)^([ \t]*)a\.isBanner = banner != null;\s*\n'
+              r'[ \t]*a\.art = banner != null \? banner : ri\.loadIcon\(pm\);'
+          )
 
           replacement = r'''\1if ("com.google.android.youtube.tv".equals(ai.packageName)
           \1        || "com.google.android.youtube".equals(ai.packageName)) {
