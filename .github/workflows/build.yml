@@ -1,4 +1,3 @@
-
 name: Build TV Home APK
 
 on:
@@ -45,66 +44,50 @@ jobs:
               ("--min-sdk-version 30", "--min-sdk-version 26"),
               ("--min-api 30", "--min-api 26"),
           ]:
-              if old not in content:
-                  raise SystemExit(f"Не найдена настройка: {old}")
-              content = content.replace(old, new)
+              if old in content:
+                  content = content.replace(old, new)
 
           path.write_text(content)
-          print("Минимальная версия Android: API 26")
+          print("Minimum Android version set to API 26 where applicable.")
           PY
 
-      - name: Fix YouTube tile and focus overlap
+      - name: Remove YouTube tile
         run: |
           python3 - <<'PY'
           from pathlib import Path
-          import re
 
-          path = Path("source/launcher/src/com/mihir/tvhome/MainActivity.java")
+          path = Path(
+              "source/launcher/src/com/mihir/tvhome/MainActivity.java"
+          )
           content = path.read_text()
 
-          banner_pattern = (
-              r'(?m)^([ \t]*)a\.isBanner = banner != null;\s*\n'
-              r'[ \t]*a\.art = banner != null \? banner : ri\.loadIcon\(pm\);'
+          class_marker = "public class MainActivity extends Activity {"
+          constant = (
+              'public class MainActivity extends Activity {\n'
+              '    private static final String HIDDEN_APP_KEYWORD = "youtube";'
           )
 
-          banner_replacement = r'''\1if (
-          \1        ai.packageName.toLowerCase().contains("youtube")
-          \1        || a.label.toLowerCase().contains("youtube")) {
-          \1    banner = null;
-          \1}
-          \1a.isBanner = banner != null;
-          \1a.art = banner != null ? banner : ri.loadIcon(pm);'''
+          if "private static final String HIDDEN_APP_KEYWORD" not in content:
+              if content.count(class_marker) != 1:
+                  raise SystemExit("Could not locate MainActivity class declaration.")
+              content = content.replace(class_marker, constant, 1)
 
-          content, banner_count = re.subn(
-              banner_pattern, banner_replacement, content, count=1
-          )
+          marker = "          ActivityInfo ai = ri.activityInfo;"
+          filter_code = '''          ActivityInfo ai = ri.activityInfo;
+                    String packageName = ai.packageName == null
+                            ? ""
+                            : ai.packageName.toLowerCase(Locale.ROOT);
+                    if (packageName.contains(HIDDEN_APP_KEYWORD)) {
+                        continue;
+                    }'''
 
-          if banner_count != 1:
-              raise SystemExit("Не найден блок выбора баннера YouTube")
-
-          focus_pattern = (
-              r'(?s)        card\.setOnFocusChangeListener\(\(v, has\) -> \{\n'
-              r'            float s = has \? \(inDock \? 1\.12f : 1\.1f\) : 1f;.*?'
-              r'            shine\.animate\(\)\.alpha\(has \? 1f : 0f\)'
-              r'\.setDuration\(160\)\.start\(\);'
-          )
-
-          focus_replacement = '''        card.setOnFocusChangeListener((v, has) -> {
-              // Stable bounds prevent focus animation from covering nearby tiles.
-              v.setScaleX(1f);
-              v.setScaleY(1f);
-              v.setTranslationZ(0f);
-              shine.animate().alpha(has ? 1f : 0f).setDuration(160).start();'''
-
-          content, focus_count = re.subn(
-              focus_pattern, focus_replacement, content, count=1
-          )
-
-          if focus_count != 1:
-              raise SystemExit("Не найден обработчик масштаба плитки")
+          if "packageName.contains(HIDDEN_APP_KEYWORD)" not in content:
+              if content.count(marker) != 1:
+                  raise SystemExit("Could not locate app enumeration block.")
+              content = content.replace(marker, filter_code, 1)
 
           path.write_text(content)
-          print("YouTube banner disabled; focus overlap fix applied.")
+          print("YouTube app entries will be skipped before tile creation.")
           PY
 
       - name: Build APK
@@ -122,3 +105,4 @@ jobs:
           name: tvhome-apk
           path: source/launcher/build/tvhome.apk
           if-no-files-found: error
+          retention-days: 7
